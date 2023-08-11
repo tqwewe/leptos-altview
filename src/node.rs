@@ -3,14 +3,16 @@ use syn::{
     parenthesized,
     parse::{discouraged::Speculative, Parse, ParseStream},
     punctuated::Punctuated,
-    token, Expr, Ident, Token,
+    token, Expr, ExprTuple, Ident, Token,
 };
+
+use crate::keyword;
 
 #[derive(Clone, Debug)]
 pub struct Node {
     pub tag: Ident,
-    pub attrs_paren_token: Option<token::Paren>,
-    pub attrs: Punctuated<Attr, Token![,]>,
+    pub fields_paren_token: Option<token::Paren>,
+    pub fields: Punctuated<Field, Token![,]>,
     pub children_paren_token: Option<token::Paren>,
     pub children: Children,
 }
@@ -19,8 +21,8 @@ impl Parse for Node {
     fn parse(input: ParseStream) -> syn::Result<Self> {
         let tag = input.parse()?;
 
-        let mut attrs_paren_token = None;
-        let mut attrs = Punctuated::default();
+        let mut fields_paren_token = None;
+        let mut fields = Punctuated::default();
 
         let mut children_paren_token = None;
         let mut children = Children::default();
@@ -32,10 +34,10 @@ impl Parse for Node {
             let content;
             let paren_token = parenthesized!(content in input);
             let fork = content.fork();
-            match fork.parse_terminated(Attr::parse, Token![,]) {
+            match fork.parse_terminated(Field::parse, Token![,]) {
                 Ok(new_attrs) => {
-                    attrs_paren_token = Some(paren_token);
-                    attrs = new_attrs;
+                    fields_paren_token = Some(paren_token);
+                    fields = new_attrs;
                     content.advance_to(&fork);
                 }
                 Err(attrs_err) => {
@@ -62,8 +64,8 @@ impl Parse for Node {
 
         Ok(Node {
             tag,
-            attrs_paren_token,
-            attrs,
+            fields_paren_token,
+            fields,
             children_paren_token,
             children,
         })
@@ -74,7 +76,7 @@ impl ToTokens for Node {
     fn to_tokens(&self, tokens: &mut proc_macro2::TokenStream) {
         let Self {
             tag,
-            attrs,
+            fields,
             children,
             ..
         } = self;
@@ -83,10 +85,42 @@ impl ToTokens for Node {
             leptos::html::#tag()
         });
 
-        for attr in attrs {
-            attr.to_tokens(tokens);
+        for field in fields {
+            field.to_tokens(tokens);
         }
         children.to_tokens(tokens);
+    }
+}
+
+#[derive(Clone, Debug)]
+pub enum Field {
+    Attr(Attr),
+    Class(Class),
+    // Event(Event),
+    // Id(Id),
+    // Ref(Ref),
+    Style(Style),
+}
+
+impl Parse for Field {
+    fn parse(input: ParseStream) -> syn::Result<Self> {
+        if input.peek(keyword::class) {
+            Ok(Field::Class(input.parse()?))
+        } else if input.peek(keyword::style) {
+            Ok(Field::Style(input.parse()?))
+        } else {
+            Ok(Field::Attr(input.parse()?))
+        }
+    }
+}
+
+impl ToTokens for Field {
+    fn to_tokens(&self, tokens: &mut proc_macro2::TokenStream) {
+        match self {
+            Field::Attr(attr) => attr.to_tokens(tokens),
+            Field::Class(class) => class.to_tokens(tokens),
+            Field::Style(style) => style.to_tokens(tokens),
+        }
     }
 }
 
@@ -111,30 +145,131 @@ impl ToTokens for Attr {
     fn to_tokens(&self, tokens: &mut proc_macro2::TokenStream) {
         let Self { name, value, .. } = self;
 
-        let expanded = if name == "class" {
-            quote! {
-                .classes(#value)
+        let name = name.to_string();
+        tokens.extend(quote! {
+            .attr(#name, #value)
+        });
+
+        // let expanded = if name == "class" {
+        //     quote! {
+        //         .classes(#value)
+        //     }
+        // } else if name == "id" {
+        //     quote! {
+        //         .id(#value)
+        //     }
+        // } else if name == "_ref" {
+        //     quote! {
+        //         .node_ref(#value)
+        //     }
+        // } else if name == "style" {
+        //     quote! {
+        //         .style(#value)
+        //     }
+        // } else {
+        //     let name = name.to_string();
+        //     quote! {
+        //         .attr(#name, #value)
+        //     }
+        // };
+
+        // tokens.extend(expanded);
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct Class {
+    pub name: keyword::class,
+    pub equals_token: Token![=],
+    pub value: ClassValue,
+}
+
+impl Parse for Class {
+    fn parse(input: ParseStream) -> syn::Result<Self> {
+        Ok(Class {
+            name: input.parse()?,
+            equals_token: input.parse()?,
+            value: input.parse()?,
+        })
+    }
+}
+
+impl ToTokens for Class {
+    fn to_tokens(&self, tokens: &mut proc_macro2::TokenStream) {
+        let expanded = match &self.value {
+            ClassValue::Static(value) => {
+                quote! {
+                    .classes(#value)
+                }
             }
-        } else if name == "id" {
-            quote! {
-                .id(#value)
-            }
-        } else if name == "_ref" {
-            quote! {
-                .node_ref(#value)
-            }
-        } else if name == "style" {
-            quote! {
-                .style(#value)
-            }
-        } else {
-            let name = name.to_string();
-            quote! {
-                .attr(#name, #value)
+            ClassValue::Dynamic(name, class) => {
+                quote! {
+                    .class(#name, #class)
+                }
             }
         };
 
         tokens.extend(expanded);
+    }
+}
+
+#[derive(Clone, Debug)]
+pub enum ClassValue {
+    Static(Expr),
+    Dynamic(Expr, Expr),
+}
+
+impl Parse for ClassValue {
+    fn parse(input: ParseStream) -> syn::Result<Self> {
+        let fork = input.fork();
+        match fork.parse::<ExprTuple>() {
+            Ok(tuple) => {
+                input.advance_to(&fork);
+
+                let tuple_len = tuple.elems.len();
+                let mut tuple_elems = tuple.elems.into_iter();
+                let name = tuple_elems
+                    .next()
+                    .ok_or_else(|| fork.error("expected a tuple with 2 items"))?;
+                let class = tuple_elems
+                    .next()
+                    .ok_or_else(|| fork.error("expected a tuple with 2 items"))?;
+
+                if tuple_elems.next().is_some() {
+                    return Err(fork.error(format!("tuple has {} items, expected 2", tuple_len)));
+                }
+
+                Ok(ClassValue::Dynamic(name, class))
+            }
+            Err(_) => Ok(ClassValue::Static(input.parse()?)),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct Style {
+    pub name: keyword::style,
+    pub equals_token: Token![=],
+    pub value: Expr,
+}
+
+impl Parse for Style {
+    fn parse(input: ParseStream) -> syn::Result<Self> {
+        Ok(Style {
+            name: input.parse()?,
+            equals_token: input.parse()?,
+            value: input.parse()?,
+        })
+    }
+}
+
+impl ToTokens for Style {
+    fn to_tokens(&self, tokens: &mut proc_macro2::TokenStream) {
+        let Self { value, .. } = self;
+
+        tokens.extend(quote! {
+            .style(#value)
+        })
     }
 }
 
